@@ -1,0 +1,3 @@
+- insert:
+    - id: zentao-panel
+      name: '@local/zentao-panel'
