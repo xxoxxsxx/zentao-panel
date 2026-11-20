@@ -11,7 +11,10 @@ A sidebar panel plugin for the DeepSeek Harness web UI that browses and manages 
 - **Filters** — unresolved/all scope, a "mine only" toggle (records assigned to or created by the signed-in account, with per-product counts), and id/title search.
 - **Detail view** — status/stage/priority metadata, sanitized rich-text descriptions and acceptance criteria, inline previews for embedded images, and download links for attachments.
 - **Write actions** (opt-in via the "allow writes" switch): assign, resolve, close, activate, and comment — each verified by reading the record back after the write.
-- **Agent tools** — `zentao_products`, `zentao_bugs`, `zentao_bug`, `zentao_stories`, `zentao_story`, `zentao_connection`, and `zentao_file` are registered so the assistant can query the same data in conversation.
+- **In-chat record cards** — `zentao_bug` / `zentao_story` / list results render as structured cards in the conversation (status, priority, stage, assignee, attachment count) instead of raw JSON, with an **Open in panel** button that focuses the matching record.
+- **Slash commands** — `/zentao <id>`, `/zentao bug <id>`, `/zentao story <id>`, and `/zentao-mine` answer inline in the chat without creating a model message or spending tokens.
+- **Panel → chat** — a record's **Send to chat** button copies a ready-to-run `/zentao …` command for the composer.
+- **Agent tools** — `zentao_products`, `zentao_bugs`, `zentao_bug`, `zentao_stories`, `zentao_story`, `zentao_connection`, and `zentao_file` are registered so the assistant can query the same data in conversation. A system-prompt section tells the agent when to use them and that writes stay panel-only.
 
 ## Requirements
 
@@ -59,6 +62,8 @@ Write operations are disabled by default. In the Connect dialog, check **允许�
 
 ## Usage notes
 
+- **Chat integration**: the read tools render as cards; the card's **Open in panel** button focuses that record in the panel (the request is queued until the panel is opened). `/zentao` and `/zentao-mine` run through the command registry, so they appear as command flow nodes rather than model messages.
+- **Send to chat** copies the command to the clipboard; the panel does not inject messages into a session directly, because message admission belongs to the session/agent layer.
 - **Comments**: ZenTao's REST v2 has no dedicated comment endpoint on this instance (the `comment` route returns 403), so comments are submitted through an assign action that keeps the current assignee unchanged. ZenTao records it as an "Assigned" action carrying the comment.
 - **Write routes** require the record id as a query parameter (`?bugID=` / `?storyID=`) in addition to the path; the client handles this automatically.
 - **Resolve with "duplicate"** requires a duplicate bug id; the panel prompts for it.

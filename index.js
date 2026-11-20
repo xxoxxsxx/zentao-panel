@@ -345,6 +345,121 @@ function apply(ctx, config) {
     },
   }), 'zentao-panel: GET /zentao-api/file/<id>');
 
+  // --- Slash commands: pull records into the chat surface without a model turn ---
+
+  /** One-line record heading shared by command output and chat text. */
+  const recordLine = (kind, record) => {
+    const tag = kind === 'story' ? 'Story' : 'Bug';
+    const status = [record.status, record.stage].filter(Boolean).join('/');
+    const who = record.assignedTo ? ` @${record.assignedTo}` : '';
+    return `#${record.id} [${tag}] ${record.title} — ${status}${who}`;
+  };
+
+  /** Resolve a bare input to a bug or story and return a bounded plain-text summary. */
+  async function describeRecord(rawInput) {
+    const parts = String(rawInput ?? '').trim().split(/\s+/).filter(Boolean);
+    if (parts.length === 0) {
+      return { ok: false, text: '用法：/zentao <编号> 或 /zentao bug <编号> / /zentao story <编号>' };
+    }
+    let kind = null;
+    let idText = parts[0];
+    if (parts[0] === 'bug' || parts[0] === 'story') {
+      kind = parts[0];
+      idText = parts[1] ?? '';
+    }
+    const id = Number(idText);
+    if (!Number.isInteger(id) || id <= 0) {
+      return { ok: false, text: '编号必须是正整数，例如 /zentao 3312' };
+    }
+    if (!client.configured) return { ok: false, text: '尚未配置禅道连接，请先在禅道面板里填写地址、账号和密码。' };
+
+    const tryKind = async (k) => (k === 'story' ? client.story(id) : client.bug(id));
+    const attempts = kind === null ? ['bug', 'story'] : [kind];
+    let lastError = null;
+    for (const k of attempts) {
+      try {
+        const detail = await tryKind(k);
+        const record = k === 'story' ? detail.story : detail.bug;
+        if (!record) continue;
+        const files = Array.isArray(detail.richFiles) ? detail.richFiles.length : 0;
+        const lines = [
+          recordLine(k, record),
+          `产品 #${record.product ?? '-'} · 优先级 ${record.pri ?? '-'}${record.severity ? ` · 严重程度 ${record.severity}` : ''}`,
+          `创建 ${record.openedBy ?? '-'} / 指派 ${record.assignedTo ?? '-'}`,
+        ];
+        if (files > 0) lines.push(`附件与内嵌图片 ${files} 个`);
+        const body = k === 'story' ? (record.spec ?? '') : (record.steps ?? '');
+        const plain = String(body).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+        if (plain) lines.push(`摘要：${plain.slice(0, 240)}${plain.length > 240 ? '…' : ''}`);
+        return { ok: true, text: lines.join('\n') };
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    return { ok: false, text: `未找到 #${id}：${describeError(lastError)}` };
+  }
+
+  /** My unfinished work across all visible products, bounded to a short digest. */
+  async function describeMine() {
+    if (!client.configured) return { ok: false, text: '尚未配置禅道连接，请先在禅道面板里填写地址、账号和密码。' };
+    const account = client.credentials?.account ?? '';
+    if (!account) return { ok: false, text: '当前连接没有账号信息。' };
+    const [bugs, stories] = await Promise.all([
+      client.allProductBugs('unresolved').catch(() => ({ total: 0, bugs: [] })),
+      client.allProductStories('unclosed').catch(() => ({ total: 0, stories: [] })),
+    ]);
+    const mine = (rows) => rows.filter((r) => r.assignedTo === account || r.openedBy === account);
+    const myBugs = mine(bugs.bugs);
+    const myStories = mine(stories.stories);
+    if (myBugs.length === 0 && myStories.length === 0) {
+      return { ok: true, text: `${account}：当前没有未完成的 Bug 或需求。` };
+    }
+    const lines = [`${account} 的未完成事项：Bug ${myBugs.length} 个，需求 ${myStories.length} 个`];
+    for (const record of myBugs.slice(0, 10)) lines.push(recordLine('bug', record));
+    if (myBugs.length > 10) lines.push(`… 另有 ${myBugs.length - 10} 个 Bug`);
+    for (const record of myStories.slice(0, 10)) lines.push(recordLine('story', record));
+    if (myStories.length > 10) lines.push(`… 另有 ${myStories.length - 10} 个需求`);
+    return { ok: true, text: lines.join('\n') };
+  }
+
+  ctx.inject(['commands'], (child) => {
+    child.effect(() => child.commands.register({
+      name: 'zentao',
+      description: '查看禅道 Bug 或研发需求的摘要（不产生模型消息）',
+      input: { hint: '<bugID|storyID>' },
+      handler: async ({ rawInput }) => {
+        if (toolBudgetExceeded()) return { kind: 'error', text: '禅道命令调用过于频繁，请稍后再试' };
+        const result = await describeRecord(rawInput);
+        return { kind: result.ok ? 'success' : 'error', text: result.text };
+      },
+    }), 'zentao-panel: command zentao');
+
+    child.effect(() => child.commands.register({
+      name: 'zentao-mine',
+      description: '汇总我名下未完成的禅道 Bug 与需求',
+      handler: async () => {
+        if (toolBudgetExceeded()) return { kind: 'error', text: '禅道命令调用过于频繁，请稍后再试' };
+        const result = await describeMine();
+        return { kind: result.ok ? 'success' : 'error', text: result.text };
+      },
+    }), 'zentao-panel: command zentao-mine');
+  });
+
+  // --- System prompt section: tell the agent what this data source is for ---
+
+  ctx.inject(['systemPrompt'], (child) => {
+    child.effect(() => child.systemPrompt.section({
+      name: 'tool:zentao-panel',
+      order: 120,
+      text: [
+        'ZenTao (禅道) 缺陷与需求数据可以通过 zentao_* 工具读取：',
+        '- zentao_products 取得产品 id；zentao_bugs / zentao_stories 按产品列表；zentao_bug / zentao_story 读单条详情（含复现步骤、验收标准与附件 id）。',
+        '- 这些工具是只读的。创建、指派、解决、关闭、激活等写操作只能在禅道面板里由用户确认执行，不能声称已经修改了工单。',
+        '- 需要展示工单内容时优先读详情，把长文本概括后回答；不要一次拉取全部产品。',
+      ].join('\n'),
+    }), 'zentao-panel: prompt section');
+  });
+
   // --- Agent tools: one operation, same client, read-only ---
 
   const renderJson = (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }];

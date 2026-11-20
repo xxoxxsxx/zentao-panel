@@ -12,6 +12,31 @@ window.__ModuleLoader__.load({
     /** Kinds of records browsable in this panel. */
     const ENTITIES = ['bugs', 'stories'];
 
+    /**
+     * In-page focus channel shared by the chat tool cards and this panel.
+     * A chat card asks the panel to reveal one record; the request survives
+     * until the panel mounts, so a card clicked while the panel is closed
+     * still lands on the right record.
+     */
+    const focusChannel = (() => {
+      let pending = null;
+      const listeners = new Set();
+      return {
+        request(target) {
+          pending = target;
+          for (const listener of listeners) {
+            try { listener(target); } catch { /* one bad listener must not break others */ }
+          }
+        },
+        peek() { return pending; },
+        clear() { pending = null; },
+        subscribe(listener) {
+          listeners.add(listener);
+          return () => listeners.delete(listener);
+        },
+      };
+    })();
+
     const zh = {
       'panel.label': '禅道',
       'title': '禅道',
@@ -28,6 +53,18 @@ window.__ModuleLoader__.load({
       'search.label': '搜索记录',
       'filter.mine.on': '仅我的（{count}）',
       'filter.mine.off': '仅我的（{count}）',
+      'card.bug': 'Bug',
+      'card.story': '需求',
+      'card.total': '共 {total} 条',
+      'card.openInPanel': '在面板中打开',
+      'card.opened': '已定位到面板',
+      'card.assignee': '指派',
+      'card.product': '产品',
+      'card.files': '{count} 个附件',
+      'card.empty': '没有可展示的结构化结果',
+      'detail.sendToChat': '发送到对话',
+      'detail.sendToChatHint': '已复制命令，粘贴到对话输入框回车即可',
+      'detail.sendToChatFailed': '复制失败，请手动输入 /zentao 命令',
       'refresh': '刷新',
       'refreshing': '刷新中…',
       'list.label': '列表',
@@ -146,6 +183,18 @@ window.__ModuleLoader__.load({
       'search.label': 'Search records',
       'filter.mine.on': 'Mine only ({count})',
       'filter.mine.off': 'Mine only ({count})',
+      'card.bug': 'Bug',
+      'card.story': 'Story',
+      'card.total': '{total} records',
+      'card.openInPanel': 'Open in panel',
+      'card.opened': 'Opened in panel',
+      'card.assignee': 'Assignee',
+      'card.product': 'Product',
+      'card.files': '{count} files',
+      'card.empty': 'No structured result to show',
+      'detail.sendToChat': 'Send to chat',
+      'detail.sendToChatHint': 'Command copied — paste it in the composer and press Enter',
+      'detail.sendToChatFailed': 'Copy failed — type the /zentao command manually',
       'refresh': 'Refresh',
       'refreshing': 'Refreshing…',
       'list.label': 'List',
@@ -579,7 +628,10 @@ window.__ModuleLoader__.load({
           [t('field.closedReason'), story.closedReason || '-'],
         ];
         return h('div', { className: 'zentao-detail' },
-          h('h2', { className: 'zentao-detail-title' }, `#${story.id} ${story.title}`),
+          h('div', { className: 'zentao-detail-head' },
+            h('h2', { className: 'zentao-detail-title' }, `#${story.id} ${story.title}`),
+            h(SendToChat, { t, entity, recordId: story.id }),
+          ),
           h('div', { className: 'zentao-meta-grid' }, rows.map(([label, value]) => (
             h('div', { className: 'zentao-meta-row', key: label },
               h('span', { className: 'zentao-meta-label' }, label),
@@ -609,7 +661,10 @@ window.__ModuleLoader__.load({
         [t('field.resolution'), bug.resolution || '-'],
       ];
       return h('div', { className: 'zentao-detail' },
-        h('h2', { className: 'zentao-detail-title' }, `#${bug.id} ${bug.title}`),
+        h('div', { className: 'zentao-detail-head' },
+          h('h2', { className: 'zentao-detail-title' }, `#${bug.id} ${bug.title}`),
+          h(SendToChat, { t, entity, recordId: bug.id }),
+        ),
         h('div', { className: 'zentao-meta-grid' }, rows.map(([label, value]) => (
           h('div', { className: 'zentao-meta-row', key: label },
             h('span', { className: 'zentao-meta-label' }, label),
@@ -647,6 +702,21 @@ window.__ModuleLoader__.load({
         api('connection').then((payload) => setConnection(payload.connection), () => setConnection(null));
       }, []);
       React.useEffect(() => { loadConnection(); }, [loadConnection]);
+
+      // Reveal a record requested by a chat card (or waiting from before mount).
+      React.useEffect(() => {
+        const reveal = (target) => {
+          if (!target) return;
+          setEntity(target.entity === 'story' ? 'stories' : 'bugs');
+          setMineOnly(false);
+          setSearch('');
+          if (target.product !== null && target.product !== undefined) setProductId(Number(target.product));
+          setSelectedId(Number(target.id));
+        };
+        const pending = focusChannel.peek();
+        if (pending !== null) { reveal(pending); focusChannel.clear(); }
+        return focusChannel.subscribe((target) => { reveal(target); focusChannel.clear(); });
+      }, []);
 
       const loadProducts = React.useCallback(() => {
         if (!configured) return;
@@ -840,6 +910,117 @@ window.__ModuleLoader__.load({
       );
     }
 
+    /**
+     * Parse one settled tool result's JSON text. The host renders tool results
+     * as a single text block holding `JSON.stringify(value, null, 2)`.
+     */
+    function parseToolJson(block) {
+      try {
+        const content = Array.isArray(block?.content) ? block.content : [];
+        const text = content
+          .filter((part) => part && part.type === 'text' && typeof part.text === 'string')
+          .map((part) => part.text)
+          .join('');
+        if (!text) return null;
+        const parsed = JSON.parse(text);
+        return parsed && typeof parsed === 'object' ? parsed : null;
+      } catch {
+        return null;
+      }
+    }
+
+    /** One clickable record row inside a chat card. */
+    function CardRecord({ t, entity, record }) {
+      const [opened, setOpened] = React.useState(false);
+      const chips = entity === 'story'
+        ? [statusChip(t, record.status), stageChip(t, record.stage), levelChip(t, t('field.pri'), record.pri)]
+        : [statusChip(t, record.status), levelChip(t, t('field.severity'), record.severity), levelChip(t, t('field.pri'), record.pri)];
+      return h('div', { className: 'zentao-card-row' },
+        h('div', { className: 'zentao-card-row-main' },
+          h('span', { className: 'zentao-card-row-title' }, `#${record.id} ${record.title}`),
+          h('span', { className: 'zentao-card-row-meta' },
+            ...chips,
+            record.assignedTo ? h('span', { className: 'zentao-card-dim' }, `${t('card.assignee')} ${record.assignedTo}`) : null,
+            record.product != null ? h('span', { className: 'zentao-card-dim' }, `${t('card.product')} #${record.product}`) : null,
+          ),
+        ),
+        h('button', {
+          type: 'button',
+          className: 'zentao-card-btn',
+          onClick: () => {
+            focusChannel.request({ entity, id: Number(record.id), product: record.product ?? null });
+            setOpened(true);
+          },
+        }, opened ? t('card.opened') : t('card.openInPanel')),
+      );
+    }
+
+    /** Chat-side card for the ZenTao read tools; replaces the raw JSON row. */
+    function ZentaoToolCard(props) {
+      const { t, toolName, phase, block } = props;
+      const data = phase === 'result' ? parseToolJson(block) : null;
+      const kindKey = { zentao_bug: 'card.bug', zentao_bugs: 'card.bug', zentao_story: 'card.story', zentao_stories: 'card.story' }[toolName];
+      const totals = data && Array.isArray(data.bugs) ? data.total ?? data.bugs.length
+        : data && Array.isArray(data.stories) ? data.total ?? data.stories.length : null;
+      const header = h('div', { className: 'zentao-card-head' },
+        h('span', { className: 'zentao-card-brand' }, '禅道'),
+        kindKey ? h('span', { className: 'zentao-card-kind' }, t(kindKey)) : null,
+        totals !== null ? h('span', { className: 'zentao-card-dim' }, t('card.total', { total: totals })) : null,
+      );
+
+      if (phase !== 'result') return h('div', { className: 'zentao-card' }, header);
+      if (data === null || data.ok === false) {
+        return h('div', { className: 'zentao-card' }, header,
+          h('div', { className: 'zentao-card-error' }, data?.message ?? t('card.empty')));
+      }
+
+      if (data.bug || data.story) {
+        const entity = data.story ? 'story' : 'bug';
+        const record = data.story ?? data.bug;
+        const files = Array.isArray(data.richFiles) ? data.richFiles.length : 0;
+        return h('div', { className: 'zentao-card' }, header,
+          h('div', { className: 'zentao-card-body' },
+            h(CardRecord, { t, entity, record }),
+            files > 0 ? h('div', { className: 'zentao-card-dim' }, t('card.files', { count: files })) : null,
+          ));
+      }
+
+      const listEntity = Array.isArray(data.stories) ? 'story' : Array.isArray(data.bugs) ? 'bug' : null;
+      if (listEntity !== null) {
+        const list = (listEntity === 'story' ? data.stories : data.bugs).slice(0, 5);
+        return h('div', { className: 'zentao-card' }, header,
+          h('div', { className: 'zentao-card-body' },
+            list.map((record) => h(CardRecord, { t, entity: listEntity, record, key: record.id })),
+            totals !== null && totals > list.length ? h('div', { className: 'zentao-card-dim' }, '…') : null,
+          ));
+      }
+
+      return h('div', { className: 'zentao-card' }, header, h('div', { className: 'zentao-card-dim' }, t('card.empty')));
+    }
+
+    /** Copy this record's /zentao command so the user can paste it into the composer. */
+    function SendToChat({ t, entity, recordId }) {
+      const [hint, setHint] = React.useState(null);
+      const send = () => {
+        const line = `/zentao ${entity === 'stories' ? 'story' : 'bug'} ${recordId}`;
+        const done = () => setHint(t('detail.sendToChatHint'));
+        const fail = () => setHint(t('detail.sendToChatFailed'));
+        try {
+          if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+            navigator.clipboard.writeText(line).then(done, fail);
+          } else {
+            fail();
+          }
+        } catch {
+          fail();
+        }
+      };
+      return h('div', { className: 'zentao-send-chat' },
+        h('button', { type: 'button', className: 'zentao-button', onClick: send }, t('detail.sendToChat')),
+        hint !== null ? h('span', { className: 'zentao-send-chat-hint' }, hint) : null,
+      );
+    }
+
     const CSS = `
 .zentao-page { display: flex; flex-direction: column; height: 100%; min-height: 0; padding: 20px 24px 16px; gap: 14px; background: var(--dsw-alias-bg-base); color: var(--dsw-alias-label-primary); overflow: auto; }
 .zentao-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding-top: var(--dsh-frame-top-clearance, 0px); }
@@ -885,6 +1066,8 @@ window.__ModuleLoader__.load({
 .zentao-detail-empty h2 { margin: 0; font-size: 15px; color: var(--dsw-alias-label-primary); font-weight: 600; }
 .zentao-detail-empty p { margin: 0; font-size: 13px; }
 .zentao-detail-title { margin: 0; font-size: 16px; line-height: 1.4; font-weight: 600; overflow-wrap: anywhere; }
+.zentao-detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.zentao-detail-head .zentao-detail-title { flex: 1; min-width: 200px; }
 .zentao-meta-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 6px 20px; }
 .zentao-meta-row { display: flex; gap: 8px; font-size: 13px; }
 .zentao-meta-label { color: var(--dsw-alias-label-secondary); flex: none; }
@@ -929,6 +1112,21 @@ window.__ModuleLoader__.load({
 .zentao-action-feedback { font-size: 12px; }
 .zentao-action-feedback-ok { color: var(--dsw-alias-state-success-primary); }
 .zentao-action-feedback-err { color: var(--dsw-alias-state-error-primary); overflow-wrap: anywhere; }
+.zentao-card { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border: 1px solid var(--dsw-alias-border-l1); border-radius: 10px; background: var(--dsw-alias-bg-layer-1); font-size: 13px; color: var(--dsw-alias-label-primary); }
+.zentao-card-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.zentao-card-brand { font-size: 11px; font-weight: 600; letter-spacing: 0.04em; color: var(--dsw-alias-brand-primary); }
+.zentao-card-kind { font-size: 12px; color: var(--dsw-alias-label-secondary); }
+.zentao-card-dim { font-size: 12px; color: var(--dsw-alias-label-secondary); }
+.zentao-card-error { font-size: 12px; color: var(--dsw-alias-state-error-primary); overflow-wrap: anywhere; }
+.zentao-card-body { display: flex; flex-direction: column; gap: 8px; }
+.zentao-card-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.zentao-card-row-main { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.zentao-card-row-title { font-weight: 500; overflow-wrap: anywhere; line-height: 1.35; }
+.zentao-card-row-meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.zentao-card-btn { flex: none; border: 1px solid var(--dsw-alias-border-l2); border-radius: 7px; background: transparent; color: var(--dsw-alias-label-secondary); padding: 3px 10px; font-size: 12px; cursor: pointer; white-space: nowrap; }
+.zentao-card-btn:hover { border-color: var(--dsw-alias-brand-primary); color: var(--dsw-alias-brand-primary); }
+.zentao-send-chat { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.zentao-send-chat-hint { font-size: 12px; color: var(--dsw-alias-label-secondary); overflow-wrap: anywhere; }
 `;
 
     return {
@@ -948,6 +1146,13 @@ window.__ModuleLoader__.load({
           locale: NS,
           label: () => t('panel.label'),
         }, ZenTaoIcon));
+
+        // Replace the generic chat row for each ZenTao read tool with a card.
+        ctx.slots.inject('tool.call.toolview', function* () {
+          for (const key of ['zentao_bug', 'zentao_bugs', 'zentao_story', 'zentao_stories']) {
+            yield ctx.slots.register({ name: 'tool.call.toolview', key, locale: NS }, ZentaoToolCard);
+          }
+        });
       },
     };
   },
