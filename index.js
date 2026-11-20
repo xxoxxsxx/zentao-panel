@@ -380,7 +380,7 @@ function apply(ctx, config) {
       try {
         const detail = await tryKind(k);
         const record = k === 'story' ? detail.story : detail.bug;
-        if (!record) continue;
+        if (!record || Number(record.id) !== id) continue;
         const files = Array.isArray(detail.richFiles) ? detail.richFiles.length : 0;
         const lines = [
           recordLine(k, record),
@@ -391,7 +391,10 @@ function apply(ctx, config) {
         const body = k === 'story' ? (record.spec ?? '') : (record.steps ?? '');
         const plain = String(body).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
         if (plain) lines.push(`摘要：${plain.slice(0, 240)}${plain.length > 240 ? '…' : ''}`);
-        return { ok: true, text: lines.join('\n') };
+        return {
+          ok: true, text: lines.join('\n'),
+          card: { view: 'record', entity: k, record: commandRecord(record), summary: `${plain.slice(0, 240)}${plain.length > 240 ? '…' : ''}`, fileCount: files },
+        };
       } catch (error) {
         lastError = error;
       }
@@ -399,27 +402,59 @@ function apply(ctx, config) {
     return { ok: false, text: `未找到 #${id}：${describeError(lastError)}` };
   }
 
+  /** Only public summary fields belong in durable command results. */
+  const commandRecord = (record) => ({
+    id: record.id,
+    title: record.title ?? '',
+    product: record.product ?? null,
+    status: record.status ?? null,
+    stage: record.stage ?? null,
+    severity: record.severity ?? null,
+    pri: record.pri ?? null,
+    assignedTo: record.assignedTo ?? null,
+  });
+
+  // CommandResult accepts text only. Store versioned JSON there so the
+  // commandview can reconstruct cards on reload without a new event type.
+  const commandResult = (result) => result.ok
+    ? { kind: 'success', text: JSON.stringify({ format: 'zentao.command', version: 1, ...result.card }) }
+    : { kind: 'error', text: result.text };
+
   /** My unfinished work across all visible products, bounded to a short digest. */
   async function describeMine() {
     if (!client.configured) return { ok: false, text: '尚未配置禅道连接，请先在禅道面板里填写地址、账号和密码。' };
     const account = client.credentials?.account ?? '';
     if (!account) return { ok: false, text: '当前连接没有账号信息。' };
-    const [bugs, stories] = await Promise.all([
-      client.allProductBugs('unresolved').catch(() => ({ total: 0, bugs: [] })),
-      client.allProductStories('unclosed').catch(() => ({ total: 0, stories: [] })),
+    const results = await Promise.allSettled([
+      client.allProductBugs('unresolved'),
+      client.allProductStories('unclosed'),
     ]);
-    const mine = (rows) => rows.filter((r) => r.assignedTo === account || r.openedBy === account);
-    const myBugs = mine(bugs.bugs);
-    const myStories = mine(stories.stories);
-    if (myBugs.length === 0 && myStories.length === 0) {
-      return { ok: true, text: `${account}：当前没有未完成的 Bug 或需求。` };
+    if (results.every((result) => result.status === 'rejected')) {
+      return { ok: false, text: `禅道查询失败：${describeError(results[0].reason)}` };
     }
-    const lines = [`${account} 的未完成事项：Bug ${myBugs.length} 个，需求 ${myStories.length} 个`];
-    for (const record of myBugs.slice(0, 10)) lines.push(recordLine('bug', record));
-    if (myBugs.length > 10) lines.push(`… 另有 ${myBugs.length - 10} 个 Bug`);
-    for (const record of myStories.slice(0, 10)) lines.push(recordLine('story', record));
-    if (myStories.length > 10) lines.push(`… 另有 ${myStories.length - 10} 个需求`);
-    return { ok: true, text: lines.join('\n') };
+    const complete = (result) => result.status === 'fulfilled'
+      && !result.value.failedProductIds?.length && !result.value.incompleteProductIds?.length;
+    const warnings = results.flatMap((result, index) => {
+      const label = index === 0 ? 'Bug' : '需求';
+      if (result.status === 'rejected') return [`${label}：${describeError(result.reason)}`];
+      return complete(result) ? [] : [`${label}：部分产品读取失败或列表未取全，当前仅显示已读取的记录，完整数量未知。`];
+    });
+    const bugs = results[0].status === 'fulfilled' ? results[0].value.bugs : [];
+    const stories = results[1].status === 'fulfilled' ? results[1].value.stories : [];
+    const mine = (rows) => rows.filter((r) => r.assignedTo === account || r.openedBy === account);
+    const myBugs = mine(bugs);
+    const myStories = mine(stories);
+    return {
+      ok: true,
+      card: {
+        view: 'mine', account,
+        bugTotal: complete(results[0]) ? myBugs.length : null,
+        storyTotal: complete(results[1]) ? myStories.length : null,
+        bugs: myBugs.slice(0, 50).map(commandRecord),
+        stories: myStories.slice(0, 50).map(commandRecord),
+        warnings,
+      },
+    };
   }
 
   ctx.inject(['commands'], (child) => {
@@ -430,7 +465,7 @@ function apply(ctx, config) {
       handler: async ({ rawInput }) => {
         if (toolBudgetExceeded()) return { kind: 'error', text: '禅道命令调用过于频繁，请稍后再试' };
         const result = await describeRecord(rawInput);
-        return { kind: result.ok ? 'success' : 'error', text: result.text };
+        return commandResult(result);
       },
     }), 'zentao-panel: command zentao');
 
@@ -440,7 +475,7 @@ function apply(ctx, config) {
       handler: async () => {
         if (toolBudgetExceeded()) return { kind: 'error', text: '禅道命令调用过于频繁，请稍后再试' };
         const result = await describeMine();
-        return { kind: result.ok ? 'success' : 'error', text: result.text };
+        return commandResult(result);
       },
     }), 'zentao-panel: command zentao-mine');
   });

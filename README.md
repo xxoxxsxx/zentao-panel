@@ -12,7 +12,7 @@ A sidebar panel plugin for the DeepSeek Harness web UI that browses and manages 
 - **Detail view** — status/stage/priority metadata, sanitized rich-text descriptions and acceptance criteria, inline previews for embedded images, and download links for attachments.
 - **Write actions** (opt-in via the "allow writes" switch): assign, resolve, close, activate, and comment — each verified by reading the record back after the write.
 - **In-chat record cards** — `zentao_bug` / `zentao_story` / list results render as structured cards in the conversation (status, priority, stage, assignee, attachment count) instead of raw JSON, with an **Open in panel** button that focuses the matching record.
-- **Slash commands** — `/zentao <id>`, `/zentao bug <id>`, `/zentao story <id>`, and `/zentao-mine` answer inline in the chat without creating a model message or spending tokens.
+- **Slash command cards** — `/zentao <id>`, `/zentao bug <id>`, `/zentao story <id>`, and `/zentao-mine` display cards through DSH's dedicated `conversation.chat.commandview` slot. My work is grouped into Bugs and Stories with status, priority, assignee, and panel navigation. Commands do not start a model turn.
 - **Panel → chat** — a record's **Send to chat** button copies a ready-to-run `/zentao …` command for the composer.
 - **Agent tools** — `zentao_products`, `zentao_bugs`, `zentao_bug`, `zentao_stories`, `zentao_story`, `zentao_connection`, and `zentao_file` are registered so the assistant can query the same data in conversation. A system-prompt section tells the agent when to use them and that writes stay panel-only.
 
@@ -62,7 +62,9 @@ Write operations are disabled by default. In the Connect dialog, check **允许�
 
 ## Usage notes
 
-- **Chat integration**: the read tools render as cards; the card's **Open in panel** button focuses that record in the panel (the request is queued until the panel is opened). `/zentao` and `/zentao-mine` run through the command registry, so they appear as command flow nodes rather than model messages.
+- **Chat integration**: tool calls use `tool.call.toolview`; slash commands use `conversation.chat.commandview`. Both have their own styles and do not require opening the panel first. **Open in panel** switches to ZenTao and selects the record.
+- **Saved command results**: new commands save versioned record snapshots in the ordinary command result text, so reopening a conversation restores cards without re-querying ZenTao. Each category initially shows five rows and can expand its saved rows (up to 50 per category). Missing or failed product reads are explicitly marked as incomplete with unknown totals.
+- **Older messages**: version 1.2.0 command text is restored into cards where possible. Those old lists saved only ten records per category; cards report saved/total counts and do not invent missing metadata or fetch current records to replace historical results. Unrecognized formats retain their original text.
 - **Send to chat** copies the command to the clipboard; the panel does not inject messages into a session directly, because message admission belongs to the session/agent layer.
 - **Comments**: ZenTao's REST v2 has no dedicated comment endpoint on this instance (the `comment` route returns 403), so comments are submitted through an assign action that keeps the current assignee unchanged. ZenTao records it as an "Assigned" action carrying the comment.
 - **Write routes** require the record id as a query parameter (`?bugID=` / `?storyID=`) in addition to the path; the client handles this automatically.
@@ -86,7 +88,10 @@ The host half holds the credentials and proxies every request, so the browser ne
 node --check index.js    # syntax-check each file after edits
 node --check client.js
 node --check zentao.js
+node --test test/*.test.mjs  # command protocol, history decoding, and slot/navigation contracts
 ```
+
+The tests use synthetic tickets and no ZenTao credentials. They cover command snapshots, legacy text, partial failures, truncation and registration/navigation. They do not emulate React/DOM or establish visual correctness; check the running DSH page for layout, light/dark themes and click behavior.
 
 Client-side changes take effect after refreshing the web UI; host-side changes are picked up by HMR (restart the app if a profile-level reload was needed).
 

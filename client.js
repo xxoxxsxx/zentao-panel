@@ -57,7 +57,18 @@ window.__ModuleLoader__.load({
       'card.story': '需求',
       'card.total': '共 {total} 条',
       'card.openInPanel': '在面板中打开',
-      'card.opened': '已定位到面板',
+      'card.openFailed': '面板打开失败，请从侧栏打开禅道后重试。',
+      'command.mine': '与我相关的未完成事项',
+      'command.record': '工单详情',
+      'command.scope': '指派给我或由我创建',
+      'command.emptyGroup': '暂无未完成事项',
+      'command.unavailable': '结果不完整，完整数量未知',
+      'command.expand': '展开其余 {count} 条',
+      'command.savedCount': '此消息保存了 {shown}/{total} 条，重新运行命令可获取较新结果（每类最多保存 50 条）。',
+      'command.legacy': '历史文本摘要：未保存优先级等字段；展开仅显示当时已保存的记录。',
+      'command.legacyDetail': '此卡片根据历史文本还原，反映当时的工单摘要。',
+      'command.fallback': '无法解析此历史结果，已保留原文。',
+      'command.failed': '禅道查询失败，请重试。',
       'card.assignee': '指派',
       'card.product': '产品',
       'card.files': '{count} 个附件',
@@ -187,7 +198,18 @@ window.__ModuleLoader__.load({
       'card.story': 'Story',
       'card.total': '{total} records',
       'card.openInPanel': 'Open in panel',
-      'card.opened': 'Opened in panel',
+      'card.openFailed': 'Could not open the panel. Open ZenTao in the sidebar and retry.',
+      'command.mine': 'My related unfinished work',
+      'command.record': 'Record detail',
+      'command.scope': 'Assigned to me or created by me',
+      'command.emptyGroup': 'No unfinished records',
+      'command.unavailable': 'Incomplete result; full count unknown',
+      'command.expand': 'Show {count} more saved records',
+      'command.savedCount': 'This message saved {shown}/{total} records. Run the command again for a newer result (up to 50 per category).',
+      'command.legacy': 'Historical text summary: priority and other metadata were not saved; expansion shows saved records only.',
+      'command.legacyDetail': 'Restored from the historical text snapshot; this is not a live record.',
+      'command.fallback': 'Could not parse this historical result. Original text is preserved.',
+      'command.failed': 'ZenTao query failed. Please retry.',
       'card.assignee': 'Assignee',
       'card.product': 'Product',
       'card.files': '{count} files',
@@ -710,7 +732,8 @@ window.__ModuleLoader__.load({
           setEntity(target.entity === 'story' ? 'stories' : 'bugs');
           setMineOnly(false);
           setSearch('');
-          if (target.product !== null && target.product !== undefined) setProductId(Number(target.product));
+          setBrowseType('all');
+          setProductId(Number(target.product) > 0 ? Number(target.product) : 'all');
           setSelectedId(Number(target.id));
         };
         const pending = focusChannel.peek();
@@ -897,14 +920,14 @@ window.__ModuleLoader__.load({
                     !loading && records !== null && rows.length === 0
                       ? h('div', { className: 'zentao-list-empty' }, t('list.empty'))
                       : rows.map((record) => h('div', { role: 'listitem', key: record.id },
-                          h(RecordRow, { t, entity, record, selected: selectedId === record.id, onSelect: setSelectedId })))),
+                          h(RecordRow, { t, entity, record, selected: String(selectedId) === String(record.id), onSelect: setSelectedId })))),
                 ),
                 h('div', { className: 'zentao-detail-pane' },
                   selectedId === null
                     ? h('div', { className: 'zentao-detail-empty' },
                         h('h2', null, t('detail.empty.title')),
                         h('p', null, t('detail.empty.body')))
-                    : h(RecordDetail, { t, entity, recordId: selectedId, allowWrites: connection?.allowWrites === true, onLoad: loadRecords, onChanged: loadRecords })),
+                    : h(RecordDetail, { key: `${entity}:${selectedId}`, t, entity, recordId: selectedId, allowWrites: connection?.allowWrites === true, onLoad: loadRecords, onChanged: loadRecords })),
               )
             : null,
       );
@@ -929,9 +952,83 @@ window.__ModuleLoader__.load({
       }
     }
 
+    // Command presentation model: pure parsing, no UI or network access.
+    function readCommandCard(node) {
+      if (!node?.outcome) return { state: 'pending' };
+      const text = String(node.outcome.text ?? '');
+      if (node.outcome.kind === 'error') return { state: 'error', text };
+      try {
+        const data = JSON.parse(text);
+        const validRecord = (record) => record && Number.isSafeInteger(Number(record.id))
+          && Number(record.id) > 0 && typeof record.title === 'string';
+        if (data?.format === 'zentao.command' && data.version === 1) {
+          if (data.view === 'record' && ['bug', 'story'].includes(data.entity) && validRecord(data.record)) {
+            return { state: 'ready', data };
+          }
+          const validTotal = (total, rows) => total === null || (Number.isSafeInteger(total) && total >= rows.length);
+          if (data.view === 'mine' && typeof data.account === 'string'
+            && Array.isArray(data.bugs) && data.bugs.every(validRecord)
+            && Array.isArray(data.stories) && data.stories.every(validRecord)
+            && validTotal(data.bugTotal, data.bugs) && validTotal(data.storyTotal, data.stories)) {
+            return { state: 'ready', data };
+          }
+        }
+      } catch { /* Older commands stored plain text. */ }
+
+      // v1.2 commands kept readable text only; preserve its saved counts and
+      // rows, without guessing metadata or re-querying today's tickets.
+      const lines = text.split(/\r?\n/);
+      const heading = /^(\S+) 的未完成事项：Bug (\d+) 个，需求 (\d+) 个/.exec(lines[0]);
+      const empty = /^(\S+)：当前没有未完成的 Bug 或需求。$/.exec(text);
+      const parseLine = (line) => {
+        const match = /^#(\d+) \[(Bug|Story)\] ([\s\S]+) — ([a-z]+)(?:\/([a-z]+))?(?: @(\S+))?$/.exec(line);
+        if (!match) return null;
+        return {
+          entity: match[2] === 'Story' ? 'story' : 'bug',
+          record: { id: Number(match[1]), title: match[3], status: match[4], stage: match[5] ?? null, assignedTo: match[6] ?? null },
+        };
+      };
+      if (heading || empty) {
+        const data = { view: 'mine', legacy: true, account: (heading ?? empty)[1],
+          bugTotal: heading ? Number(heading[2]) : 0, storyTotal: heading ? Number(heading[3]) : 0, bugs: [], stories: [] };
+        let row = '';
+        let invalid = false;
+        const append = () => {
+          if (!row) return;
+          const parsed = parseLine(row);
+          if (parsed) data[parsed.entity === 'bug' ? 'bugs' : 'stories'].push(parsed.record);
+          else invalid = true;
+          row = '';
+        };
+        for (const line of lines.slice(1)) {
+          if (/^#\d+ \[(Bug|Story)\]/.test(line)) { append(); row = line; }
+          else if (line.startsWith('…')) append();
+          else if (row) row += ` ${line.trim()}`;
+        }
+        append();
+        if (!invalid && data.bugTotal >= data.bugs.length && data.storyTotal >= data.stories.length) return { state: 'ready', data };
+      }
+      const single = parseLine(lines[0]);
+      if (single && node.name === 'zentao') {
+        const metadata = lines[1] ?? '';
+        const product = /产品 #(\d+)/.exec(metadata);
+        const priority = /优先级 (\d+)/.exec(metadata);
+        const severity = /严重程度 (\d+)/.exec(metadata);
+        const files = /附件与内嵌图片 (\d+) 个/.exec(text);
+        return { state: 'ready', data: { view: 'record', legacy: true, ...single,
+          record: { ...single.record, product: product ? Number(product[1]) : null,
+            pri: priority?.[1] ?? null, severity: severity?.[1] ?? null },
+          fileCount: files ? Number(files[1]) : 0,
+          summary: lines.find((line) => line.startsWith('摘要：'))?.slice(3) ?? '',
+        } };
+      }
+      return { state: 'fallback', text };
+    }
+    // End command presentation model.
+
     /** One clickable record row inside a chat card. */
-    function CardRecord({ t, entity, record }) {
-      const [opened, setOpened] = React.useState(false);
+    function CardRecord({ t, entity, record, openRecord }) {
+      const [openError, setOpenError] = React.useState(null);
       const chips = entity === 'story'
         ? [statusChip(t, record.status), stageChip(t, record.stage), levelChip(t, t('field.pri'), record.pri)]
         : [statusChip(t, record.status), levelChip(t, t('field.severity'), record.severity), levelChip(t, t('field.pri'), record.pri)];
@@ -947,23 +1044,78 @@ window.__ModuleLoader__.load({
         h('button', {
           type: 'button',
           className: 'zentao-card-btn',
+          'aria-label': `${t('card.openInPanel')} #${record.id}`,
           onClick: () => {
-            focusChannel.request({ entity, id: Number(record.id), product: record.product ?? null });
-            setOpened(true);
+            try {
+              openRecord({ entity, id: Number(record.id), product: record.product ?? null });
+              setOpenError(null);
+            } catch {
+              setOpenError(t('card.openFailed'));
+            }
           },
-        }, opened ? t('card.opened') : t('card.openInPanel')),
+        }, t('card.openInPanel')),
+        openError ? h('span', { className: 'zentao-card-error', role: 'alert' }, openError) : null,
+      );
+    }
+
+    /** Saved records in one category; expanding never re-fetches or invents rows. */
+    function CommandGroup({ t, entity, records, total, openRecord }) {
+      const shown = records.slice(0, 5);
+      const rest = records.slice(5);
+      const row = (record) => h(CardRecord, { key: `${entity}:${record.id}`, t, entity, record, openRecord });
+      return h('section', { className: 'zentao-command-group' },
+        h('h3', { className: 'zentao-command-group-title' },
+          t(entity === 'bug' ? 'card.bug' : 'card.story'),
+          h('span', { className: 'zentao-command-count' }, total === null ? '—' : total)),
+        total === null ? h('p', { className: 'zentao-card-error' }, t('command.unavailable')) : null,
+        total === 0 ? h('p', { className: 'zentao-card-dim' }, t('command.emptyGroup')) : null,
+        shown.map(row),
+        rest.length > 0 ? h('details', { className: 'zentao-command-more' },
+          h('summary', null, t('command.expand', { count: rest.length })), rest.map(row)) : null,
+        total > records.length ? h('p', { className: 'zentao-card-dim' },
+          t('command.savedCount', { shown: records.length, total })) : null,
+      );
+    }
+
+    /** The command slot receives a CommandNode directly, unlike toolview props. */
+    function ZentaoCommandCard({ t, node, openRecord }) {
+      const model = readCommandCard(node);
+      const data = model.data;
+      return h('div', { className: 'zentao-card zentao-command', 'data-zentao-command': node?.name },
+        h(PanelStyles),
+        h('header', { className: 'zentao-card-head' },
+          h('span', { className: 'zentao-card-brand' }, t('panel.label')),
+          h('strong', { className: 'zentao-command-title' }, t(node?.name === 'zentao-mine' ? 'command.mine' : 'command.record')),
+          h('span', { className: 'zentao-card-dim' }, `/${node?.name ?? 'zentao'}`)),
+        model.state === 'pending' ? h('p', { role: 'status', className: 'zentao-card-dim' }, t('list.loading')) : null,
+        model.state === 'error' ? h('p', { role: 'alert', className: 'zentao-card-error' }, model.text || t('command.failed')) : null,
+        model.state === 'fallback' ? h('div', null,
+          h('p', { className: 'zentao-card-dim' }, t('command.fallback')),
+          h('pre', { className: 'zentao-command-fallback' }, model.text)) : null,
+        model.state === 'ready' && data.view === 'mine' ? h('div', { className: 'zentao-command-body' },
+          h('p', { className: 'zentao-card-dim' }, `${data.account} · ${t('command.scope')}`),
+          (Array.isArray(data.warnings) ? data.warnings : []).map((message, index) =>
+            h('p', { role: 'status', className: 'zentao-card-error', key: index }, message)),
+          h(CommandGroup, { t, entity: 'bug', records: data.bugs, total: data.bugTotal, openRecord }),
+          h(CommandGroup, { t, entity: 'story', records: data.stories, total: data.storyTotal, openRecord })) : null,
+        model.state === 'ready' && data.view === 'record' ? h('div', { className: 'zentao-card-body' },
+          h(CardRecord, { t, entity: data.entity, record: data.record, openRecord }),
+          data.summary ? h('p', { className: 'zentao-command-summary' }, data.summary) : null,
+          Number.isSafeInteger(data.fileCount) && data.fileCount > 0 ? h('span', { className: 'zentao-card-dim' }, t('card.files', { count: data.fileCount })) : null) : null,
+        data?.legacy ? h('p', { className: 'zentao-card-dim' }, t(data.view === 'mine' ? 'command.legacy' : 'command.legacyDetail')) : null,
       );
     }
 
     /** Chat-side card for the ZenTao read tools; replaces the raw JSON row. */
     function ZentaoToolCard(props) {
-      const { t, toolName, phase, block } = props;
+      const { t, toolName, phase, block, openRecord } = props;
       const data = phase === 'result' ? parseToolJson(block) : null;
       const kindKey = { zentao_bug: 'card.bug', zentao_bugs: 'card.bug', zentao_story: 'card.story', zentao_stories: 'card.story' }[toolName];
       const totals = data && Array.isArray(data.bugs) ? data.total ?? data.bugs.length
         : data && Array.isArray(data.stories) ? data.total ?? data.stories.length : null;
       const header = h('div', { className: 'zentao-card-head' },
-        h('span', { className: 'zentao-card-brand' }, '禅道'),
+        h(PanelStyles),
+        h('span', { className: 'zentao-card-brand' }, t('panel.label')),
         kindKey ? h('span', { className: 'zentao-card-kind' }, t(kindKey)) : null,
         totals !== null ? h('span', { className: 'zentao-card-dim' }, t('card.total', { total: totals })) : null,
       );
@@ -980,7 +1132,7 @@ window.__ModuleLoader__.load({
         const files = Array.isArray(data.richFiles) ? data.richFiles.length : 0;
         return h('div', { className: 'zentao-card' }, header,
           h('div', { className: 'zentao-card-body' },
-            h(CardRecord, { t, entity, record }),
+            h(CardRecord, { t, entity, record, openRecord }),
             files > 0 ? h('div', { className: 'zentao-card-dim' }, t('card.files', { count: files })) : null,
           ));
       }
@@ -990,7 +1142,7 @@ window.__ModuleLoader__.load({
         const list = (listEntity === 'story' ? data.stories : data.bugs).slice(0, 5);
         return h('div', { className: 'zentao-card' }, header,
           h('div', { className: 'zentao-card-body' },
-            list.map((record) => h(CardRecord, { t, entity: listEntity, record, key: record.id })),
+            list.map((record) => h(CardRecord, { t, entity: listEntity, record, openRecord, key: record.id })),
             totals !== null && totals > list.length ? h('div', { className: 'zentao-card-dim' }, '…') : null,
           ));
       }
@@ -1112,14 +1264,27 @@ window.__ModuleLoader__.load({
 .zentao-action-feedback { font-size: 12px; }
 .zentao-action-feedback-ok { color: var(--dsw-alias-state-success-primary); }
 .zentao-action-feedback-err { color: var(--dsw-alias-state-error-primary); overflow-wrap: anywhere; }
-.zentao-card { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border: 1px solid var(--dsw-alias-border-l1); border-radius: 10px; background: var(--dsw-alias-bg-layer-1); font-size: 13px; color: var(--dsw-alias-label-primary); }
+.zentao-card { display: flex; flex-direction: column; gap: 12px; padding: 14px 16px; border: 1px solid var(--dsw-alias-border-l1); border-radius: 10px; background: var(--dsw-alias-bg-layer-1); font: 13px/1.5 system-ui, sans-serif; color: var(--dsw-alias-label-primary); min-width: 0; }
+.zentao-command-title { font-size: 14px; font-weight: 600; }
+.zentao-command-body, .zentao-command-group { display: flex; flex-direction: column; gap: 12px; }
+.zentao-command p { margin: 0; }
+.zentao-command-group { border-top: 1px solid var(--dsw-alias-border-l1); padding-top: 12px; }
+.zentao-command-group-title { display: flex; align-items: center; gap: 8px; margin: 0; font-size: 13px; font-weight: 600; }
+.zentao-command-count { border: 1px solid var(--dsw-alias-border-l1); border-radius: 999px; padding: 0 8px; font-variant-numeric: tabular-nums; }
+.zentao-command-more > summary { cursor: pointer; color: var(--dsw-alias-brand-primary); padding: 4px 0; }
+.zentao-command-more .zentao-card-row { margin-top: 12px; }
+.zentao-command-summary, .zentao-command-fallback { white-space: pre-wrap; overflow-wrap: anywhere; }
+.zentao-command-fallback { margin: 8px 0 0; max-height: 240px; overflow: auto; font: inherit; }
+.zentao-card-btn:focus-visible, .zentao-command-more > summary:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: 3px; }
 .zentao-card-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .zentao-card-brand { font-size: 11px; font-weight: 600; letter-spacing: 0.04em; color: var(--dsw-alias-brand-primary); }
 .zentao-card-kind { font-size: 12px; color: var(--dsw-alias-label-secondary); }
 .zentao-card-dim { font-size: 12px; color: var(--dsw-alias-label-secondary); }
 .zentao-card-error { font-size: 12px; color: var(--dsw-alias-state-error-primary); overflow-wrap: anywhere; }
 .zentao-card-body { display: flex; flex-direction: column; gap: 8px; }
-.zentao-card-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.zentao-card-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.zentao-card-row-main { flex: 1 1 220px; }
+.zentao-card-row + .zentao-card-row { border-top: 1px solid var(--dsw-alias-border-l1); padding-top: 12px; }
 .zentao-card-row-main { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .zentao-card-row-title { font-weight: 500; overflow-wrap: anywhere; line-height: 1.35; }
 .zentao-card-row-meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
@@ -1130,7 +1295,7 @@ window.__ModuleLoader__.load({
 `;
 
     return {
-      inject: ['slots', 'locale'],
+      inject: ['slots', 'locale', 'layout'],
       apply(ctx) {
         ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'zentao-panel: dictionaries');
         const t = ctx.locale.bind(NS);
@@ -1147,10 +1312,28 @@ window.__ModuleLoader__.load({
           label: () => t('panel.label'),
         }, ZenTaoIcon));
 
-        // Replace the generic chat row for each ZenTao read tool with a card.
+        const cardActions = {
+          openRecord(target) {
+            focusChannel.request(target);
+            try {
+              ctx.layout.selectPanel(PANEL_ID);
+            } catch (error) {
+              focusChannel.clear();
+              throw error;
+            }
+          },
+        };
+
+        // Slash commands and model tool calls have different dispatch seats.
+        // CommandNodeView passes { node: CommandNode }, keyed by node.name.
+        ctx.slots.inject('conversation.chat.commandview', function* () {
+          for (const key of ['zentao', 'zentao-mine']) {
+            yield ctx.slots.register({ name: 'conversation.chat.commandview', key, locale: NS, inject: () => cardActions }, ZentaoCommandCard);
+          }
+        });
         ctx.slots.inject('tool.call.toolview', function* () {
           for (const key of ['zentao_bug', 'zentao_bugs', 'zentao_story', 'zentao_stories']) {
-            yield ctx.slots.register({ name: 'tool.call.toolview', key, locale: NS }, ZentaoToolCard);
+            yield ctx.slots.register({ name: 'tool.call.toolview', key, locale: NS, inject: () => cardActions }, ZentaoToolCard);
           }
         });
       },

@@ -218,14 +218,20 @@ class ZenTaoClient {
     const pages = await Promise.all(products.map(async (product) => {
       try {
         const page = await this.getJson(`/products/${encodeURIComponent(String(product.id))}/bugs?browseType=${type}&orderBy=id_desc&recPerPage=1000&pageID=1`);
-        return this.bugList(page);
+        if (page?.status === 'fail' || !Array.isArray(page.bugs)) throw new Error('Invalid product result');
+        const normalized = this.bugList(page);
+        return { ...normalized, incompleteProductId: Number(page.pager?.recTotal ?? normalized.total) > normalized.bugs.length ? product.id : null };
       } catch {
-        // One inaccessible product must not break the aggregate view.
-        return { total: 0, bugs: [] };
+        // Preserve partial results and expose their incompleteness to callers.
+        return { total: 0, bugs: [], failedProductId: product.id };
       }
     }));
     const bugs = pages.flatMap((page) => page.bugs).sort((a, b) => Number(b.id) - Number(a.id));
-    return { total: pages.reduce((sum, page) => sum + page.total, 0), bugs };
+    return {
+      total: pages.reduce((sum, page) => sum + Number(page.total), 0), bugs,
+      failedProductIds: pages.flatMap((page) => page.failedProductId == null ? [] : [page.failedProductId]),
+      incompleteProductIds: pages.flatMap((page) => page.incompleteProductId == null ? [] : [page.incompleteProductId]),
+    };
   }
 
   /** Stories of one product (browseType: unclosed | all; "unresolved" is a bug-only value). */
@@ -247,16 +253,20 @@ class ZenTaoClient {
     const pages = await Promise.all(products.map(async (product) => {
       try {
         const page = await this.getJson(`/products/${encodeURIComponent(String(product.id))}/stories?browseType=${type}&orderBy=id_desc&recPerPage=1000&pageID=1`);
-        if (page && page.status === 'fail') return { total: 0, stories: [] };
-        const stories = Array.isArray(page.stories) ? page.stories : [];
-        return { total: page.pager?.recTotal ?? stories.length, stories: stories.map((story) => this.storySummary(story)) };
+        if (page?.status === 'fail' || !Array.isArray(page.stories)) throw new Error('Invalid product result');
+        const stories = page.stories;
+        const total = Number(page.pager?.recTotal ?? stories.length);
+        return { total, stories: stories.map((story) => this.storySummary(story)), incompleteProductId: total > stories.length ? product.id : null };
       } catch {
-        // One inaccessible product must not break the aggregate view.
-        return { total: 0, stories: [] };
+        return { total: 0, stories: [], failedProductId: product.id };
       }
     }));
     const stories = pages.flatMap((page) => page.stories).sort((a, b) => Number(b.id) - Number(a.id));
-    return { total: pages.reduce((sum, page) => sum + page.total, 0), stories };
+    return {
+      total: pages.reduce((sum, page) => sum + Number(page.total), 0), stories,
+      failedProductIds: pages.flatMap((page) => page.failedProductId == null ? [] : [page.failedProductId]),
+      incompleteProductIds: pages.flatMap((page) => page.incompleteProductId == null ? [] : [page.incompleteProductId]),
+    };
   }
 
   /** One story's full detail, with embedded file ids extracted from rich text. */
