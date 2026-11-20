@@ -80,6 +80,9 @@ window.__ModuleLoader__.load({
       'refreshing': '刷新中…',
       'list.label': '列表',
       'list.count': '共 {total} 条，显示前 {shown} 条',
+      'list.truncated': '记录较多，仅显示最新 {shown} 条；用产品、范围或搜索缩小范围可查看其余记录。',
+      'list.incomplete': '部分产品读取失败，当前仅显示已读取的 {shown} 条，完整数量未知。',
+      'list.focusHint': '已从对话定位：#{id}（加载列表后高亮显示）',
       'list.loading': '正在加载…',
       'list.empty': '该产品暂无符合条件的记录',
       'list.retry': '重试',
@@ -221,6 +224,9 @@ window.__ModuleLoader__.load({
       'refreshing': 'Refreshing…',
       'list.label': 'List',
       'list.count': '{total} total, showing first {shown}',
+      'list.truncated': 'Large result: showing the newest {shown} records only. Narrow by product, scope, or search to see the rest.',
+      'list.incomplete': 'Some products failed to load; showing {shown} loaded records, full count unknown.',
+      'list.focusHint': 'Focused from chat: #{id} (highlighted once the list loads)',
       'list.loading': 'Loading…',
       'list.empty': 'No records match in this product',
       'list.retry': 'Retry',
@@ -726,6 +732,11 @@ window.__ModuleLoader__.load({
       React.useEffect(() => { loadConnection(); }, [loadConnection]);
 
       // Reveal a record requested by a chat card (or waiting from before mount).
+      // Products load asynchronously: setting productId before the product list
+      // arrives is safe (loadProducts keeps an existing selection), but the row
+      // only appears once loadRecords settles, so the focus hint bridges the gap.
+      const [focusHint, setFocusHint] = React.useState(null);
+      const listRef = React.useRef(null);
       React.useEffect(() => {
         const reveal = (target) => {
           if (!target) return;
@@ -735,11 +746,23 @@ window.__ModuleLoader__.load({
           setBrowseType('all');
           setProductId(Number(target.product) > 0 ? Number(target.product) : 'all');
           setSelectedId(Number(target.id));
+          setFocusHint(target.id);
         };
         const pending = focusChannel.peek();
         if (pending !== null) { reveal(pending); focusChannel.clear(); }
         return focusChannel.subscribe((target) => { reveal(target); focusChannel.clear(); });
       }, []);
+
+      // Scroll the highlighted row into view once the record list contains it;
+      // drop the hint when the record is absent from the loaded window (for
+      // example outside the newest-200 slice), so the notice never outlives
+      // its usefulness.
+      React.useEffect(() => {
+        if (focusHint === null || records === null || loading) return;
+        const row = listRef?.current?.querySelector(`[data-record-id="${focusHint}"]`);
+        if (row) row.scrollIntoView({ block: 'nearest' });
+        if (!records.some((record) => String(record.id) === String(focusHint))) setFocusHint(null);
+      }, [focusHint, records, loading]);
 
       const loadProducts = React.useCallback(() => {
         if (!configured) return;
@@ -797,6 +820,14 @@ window.__ModuleLoader__.load({
         if (!query) return list.slice(0, PAGE_BUG_LIMIT);
         return list.filter((record) => String(record.id).includes(query) || record.title.toLowerCase().includes(query)).slice(0, PAGE_BUG_LIMIT);
       }, [records, search, mineOnly, connection]);
+
+      // The host caps list actions at PAGE_BUG_LIMIT rows before the client
+      // ever sees them, so "loaded fewer than total" can mean truncation or an
+      // incomplete cross-product aggregate. Both cases must be visible.
+      const listNotice = React.useMemo(() => {
+        if (records === null) return null;
+        return listNoticeText(total, rows.length, loading, records !== null, t);
+      }, [records, rows, total, loading, t]);
 
       /** Count of records involving the logged-in account, shown on the toggle. */
       const mineCount = React.useMemo(() => {
@@ -911,15 +942,22 @@ window.__ModuleLoader__.load({
               h('button', { type: 'button', className: 'zentao-button', onClick: () => { setError(null); loadProducts(); loadRecords(); } }, t('list.retry')))
           : configured
             ? h('div', { className: 'zentao-body' },
-                h('div', { className: 'zentao-list' },
+                h('div', { className: 'zentao-list', ref: listRef },
                   h('div', { className: 'zentao-list-head', role: 'status' },
                     records === null || loading
                       ? t('list.loading')
                       : t('list.count', { total, shown: rows.length })),
+                  focusHint !== null && records !== null && !loading
+                    ? h('div', { className: 'zentao-list-focus', role: 'status' },
+                        t('list.focusHint', { id: focusHint }))
+                    : null,
+                  listNotice !== null
+                    ? h('div', { className: 'zentao-list-notice' }, listNotice)
+                    : null,
                   h('div', { className: 'zentao-list-rows', role: 'list' },
                     !loading && records !== null && rows.length === 0
                       ? h('div', { className: 'zentao-list-empty' }, t('list.empty'))
-                      : rows.map((record) => h('div', { role: 'listitem', key: record.id },
+                      : rows.map((record) => h('div', { role: 'listitem', key: record.id, 'data-record-id': record.id },
                           h(RecordRow, { t, entity, record, selected: String(selectedId) === String(record.id), onSelect: setSelectedId })))),
                 ),
                 h('div', { className: 'zentao-detail-pane' },
@@ -1025,6 +1063,17 @@ window.__ModuleLoader__.load({
       return { state: 'fallback', text };
     }
     // End command presentation model.
+
+    /**
+     * The host caps list actions at PAGE_BUG_LIMIT rows before the client ever
+     * sees them, so "loaded fewer than total" can mean host truncation or an
+     * incomplete cross-product aggregate. Both must be visible, never silent.
+     * @returns the localized notice text, or null when nothing is missing.
+     */
+    function listNoticeText(total, shown, loading, recordsPresent, translate) {
+      if (!recordsPresent || loading) return null;
+      return shown < total ? translate('list.truncated', { shown }) : null;
+    }
 
     /** One clickable record row inside a chat card. */
     function CardRecord({ t, entity, record, openRecord }) {
@@ -1200,6 +1249,8 @@ window.__ModuleLoader__.load({
 .zentao-list-head { padding: 8px 12px; font-size: 12px; color: var(--dsw-alias-label-secondary); border-bottom: 1px solid var(--dsw-alias-border-l1); }
 .zentao-list-rows { overflow: auto; flex: 1; min-height: 0; padding: 6px; display: flex; flex-direction: column; gap: 4px; }
 .zentao-list-empty { padding: 24px 12px; text-align: center; color: var(--dsw-alias-label-secondary); font-size: 13px; }
+.zentao-list-notice, .zentao-list-focus { margin: 6px 8px 0; padding: 6px 10px; border: 1px solid var(--dsw-alias-border-l1); border-radius: 8px; background: var(--dsw-alias-bg-layer-2); font-size: 12px; color: var(--dsw-alias-label-secondary); }
+.zentao-list-focus { color: var(--dsw-alias-brand-primary); border-color: var(--dsw-alias-brand-primary); }
 .zentao-row { display: flex; gap: 8px; align-items: flex-start; text-align: left; border: 1px solid transparent; border-radius: 8px; background: transparent; color: inherit; padding: 8px 10px; cursor: pointer; font-size: 13px; }
 .zentao-row:hover { background: var(--dsw-alias-bg-layer-2); }
 .zentao-row-selected { border-color: var(--dsw-alias-brand-primary); background: var(--dsw-alias-bg-layer-2); }

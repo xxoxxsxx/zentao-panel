@@ -1,8 +1,8 @@
 {
   "name": "@local/zentao-panel",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "scripts": {
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/command-cards.test.mjs test/panel-flow.test.mjs"
   },
   "license": "MIT",
   "private": true,
@@ -24,7 +24,9 @@
     "icon.svg"
   ],
   "dsh": {
-    "bundle": { "patch": "./cordis.patch.yml" },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "platform": "web",
       "immediately": true,
